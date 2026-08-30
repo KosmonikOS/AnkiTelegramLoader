@@ -1,30 +1,37 @@
-"""Set up unattended scheduling: a pmset wake schedule and a LaunchAgent.
+"""Set up unattended scheduling: a self-renewing pmset wake schedule and a LaunchAgent.
 
 Reads ``config.WAKE_TIMES`` and, in one step, registers a macOS wake-from-
 sleep schedule and a LaunchAgent that runs ``vocab-batch`` at each
 configured time. Re-run this after editing ``WAKE_TIMES`` in ``.env`` —
 never hand-edit the generated plist or `pmset` state directly.
 
-Important caveat: macOS's ``pmset repeat`` mechanism supports only a single
-recurring wake event, not one per ``WAKE_TIMES`` entry (see ``man pmset``).
-Only the earliest configured time is registered with `pmset`, so only that
-time reliably wakes the Mac from sleep. Every configured time still gets a
-LaunchAgent trigger, but a time other than the earliest only fires if the
-Mac happens to already be awake at that moment.
+macOS's ``pmset repeat`` mechanism supports only a single recurring wake
+event, not one per ``WAKE_TIMES`` entry (see ``man pmset``), so it can't
+express "wake at 08:00 and 20:00 every day" directly. Instead this uses
+``pmset schedule wake``, which accepts multiple one-time wake events in a
+single command (one ``wake "<date>"`` pair per configured time). Because
+those are one-shot — each is consumed once it fires — :func:`schedule_wake_events`
+is also called as the first phase of every :mod:`vocab_pipeline.run_batch`
+run, so each run re-arms the next occurrence of every configured time. As
+long as runs keep completing, the schedule keeps renewing itself
+indefinitely; see the README for what happens if that chain breaks.
 """
 
 import plistlib
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from vocab_pipeline import config
 from vocab_pipeline.config import ConfigError
 
-PMSET_DAYS = "MTWRFSU"
 LAUNCH_AGENT_LABEL = "com.user.vocabpipeline"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+PMSET_DATE_FORMAT = "%m/%d/%y %H:%M:%S"
+REARM_BUFFER = timedelta(minutes=1)
+"""How close to "now" a wake time must be to count as already passed."""
 
 
 def _parse_wake_time(value: str) -> tuple[int, int]:
@@ -51,29 +58,57 @@ def _parse_wake_time(value: str) -> tuple[int, int]:
     return hour, minute
 
 
-def update_pmset_wake_schedule(wake_times: list[str]) -> str:
-    """Register the earliest configured time as the macOS recurring wake time.
+def _next_occurrence(hour: int, minute: int, now: datetime) -> datetime:
+    """Compute the next wall-clock occurrence of an ``HH:MM`` time.
+
+    Args:
+        hour: Target hour (0-23).
+        minute: Target minute (0-59).
+        now: The current local time.
+
+    Returns:
+        ``now``'s date at ``hour:minute``, or the following day's if that
+        moment is within :data:`REARM_BUFFER` of ``now`` or already past —
+        so re-arming a wake event from inside the run it just triggered
+        always rolls over to tomorrow instead of re-scheduling a moment
+        that's already gone.
+    """
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now + REARM_BUFFER:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def schedule_wake_events(wake_times: list[str], now: datetime | None = None) -> list[datetime]:
+    """Arm a one-time `pmset` wake event for each configured time's next occurrence.
+
+    macOS's `pmset schedule` holds a set of one-shot events and is not
+    additive across separate invocations — a later call replaces whatever a
+    previous call scheduled — so every configured time is (re-)armed
+    together in a single `pmset schedule` command.
 
     Args:
         wake_times: Configured "HH:MM" wake times.
+        now: The current local time. Defaults to :func:`datetime.now`.
 
     Returns:
-        The "HH:MM" time that was actually registered with `pmset`.
+        The datetime scheduled for each entry, in ``wake_times`` order.
 
     Raises:
         ConfigError: If ``wake_times`` is empty or contains an invalid entry.
     """
     if not wake_times:
         raise ConfigError("WAKE_TIMES is empty; nothing to schedule.")
-    for value in wake_times:
-        _parse_wake_time(value)  # validate every entry up front
+    current = now if now is not None else datetime.now()
 
-    chosen = min(wake_times, key=_parse_wake_time)
-    subprocess.run(
-        ["sudo", "pmset", "repeat", "wake", PMSET_DAYS, f"{chosen}:00"],
-        check=True,
-    )
-    return chosen
+    occurrences = [_next_occurrence(*_parse_wake_time(value), current) for value in wake_times]
+
+    command = ["sudo", "pmset", "schedule"]
+    for occurrence in occurrences:
+        command += ["wake", occurrence.strftime(PMSET_DATE_FORMAT)]
+    subprocess.run(command, check=True)
+
+    return occurrences
 
 
 def find_vocab_batch_executable() -> str:
@@ -148,13 +183,13 @@ def load_launch_agent(path: Path) -> None:
 
 
 def generate_launchagent() -> Path:
-    """Run the full scheduling setup: pmset wake time + LaunchAgent.
+    """Run the full scheduling setup: pmset wake events + LaunchAgent.
 
     Returns:
         The path the LaunchAgent plist was written to.
     """
     vocab_batch_path = find_vocab_batch_executable()
-    update_pmset_wake_schedule(config.WAKE_TIMES)
+    schedule_wake_events(config.WAKE_TIMES)
 
     plist = build_launch_agent_plist(vocab_batch_path, config.WAKE_TIMES)
     plist_path = LAUNCH_AGENTS_DIR / f"{LAUNCH_AGENT_LABEL}.plist"
@@ -166,12 +201,13 @@ def generate_launchagent() -> Path:
 def main() -> None:
     """CLI entry point for the ``vocab-setup-schedule`` command."""
     plist_path = generate_launchagent()
-    chosen = min(config.WAKE_TIMES, key=_parse_wake_time)
     print(f"LaunchAgent written and loaded: {plist_path}")
     print(f"Triggers vocab-batch at: {', '.join(config.WAKE_TIMES)}")
     print(
-        f"macOS wake-from-sleep is registered for {chosen} only (pmset supports a single "
-        "recurring wake time) — other times only fire if the Mac is already awake."
+        "Each time's next wake event is armed with `pmset schedule wake`. "
+        "vocab-batch re-arms the following occurrence of every time on each "
+        "run, so run `pmset -g sched` any time to confirm all of them are "
+        "still pending."
     )
 
 

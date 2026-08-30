@@ -379,6 +379,18 @@ Anki quitting mid-sync.
 
 ## Scheduling
 
+> **Correction (post-implementation):** the `pmset repeat wake` loop shown
+> below does not actually schedule multiple daily wake times — macOS's
+> `pmset repeat` mechanism holds only one recurring wake event, so each
+> iteration of the loop silently overwrites the previous one, leaving only
+> the last `WAKE_TIMES` entry actually able to wake the Mac from sleep.
+> The shipped implementation (`generate_launchagent.schedule_wake_events`)
+> uses `pmset schedule wake` instead — a set of one-time wake events, which
+> *can* hold one entry per configured time — and has `vocab-batch` re-arm
+> the next occurrence of every time as its first step on each run, so the
+> schedule keeps renewing itself. See the README's Scheduling section for
+> the full mechanism and its failure mode.
+
 `WAKE_TIMES` in `.env` is the single source of truth for when this runs —
 nothing time-related is hardcoded elsewhere. A small setup script,
 `generate_launchagent.py`, reads it and produces both the `pmset` wake

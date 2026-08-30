@@ -1,6 +1,7 @@
 """Tests for vocab_pipeline.generate_launchagent."""
 
 import plistlib
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -22,19 +23,49 @@ def test_parse_wake_time_rejects_bad_format() -> None:
         gla._parse_wake_time("25:00")
 
 
-def test_update_pmset_wake_schedule_picks_earliest() -> None:
+def test_next_occurrence_later_today() -> None:
+    now = datetime(2026, 8, 30, 6, 0, 0)
+    assert gla._next_occurrence(8, 0, now) == datetime(2026, 8, 30, 8, 0, 0)
+
+
+def test_next_occurrence_rolls_to_tomorrow_when_passed() -> None:
+    now = datetime(2026, 8, 30, 9, 0, 0)
+    assert gla._next_occurrence(8, 0, now) == datetime(2026, 8, 31, 8, 0, 0)
+
+
+def test_next_occurrence_rolls_to_tomorrow_within_buffer() -> None:
+    # Re-arming from inside the run a time itself triggered: "now" is only
+    # seconds after that time, which must still count as already passed.
+    now = datetime(2026, 8, 30, 8, 0, 5)
+    assert gla._next_occurrence(8, 0, now) == datetime(2026, 8, 31, 8, 0, 0)
+
+
+def test_schedule_wake_events_arms_every_time_in_one_command() -> None:
+    now = datetime(2026, 8, 30, 6, 0, 0)
     with patch("vocab_pipeline.generate_launchagent.subprocess.run") as mock_run:
-        chosen = gla.update_pmset_wake_schedule(["20:00", "08:00", "14:30"])
-    assert chosen == "08:00"
+        occurrences = gla.schedule_wake_events(["20:00", "08:00"], now=now)
+
+    assert occurrences == [
+        datetime(2026, 8, 30, 20, 0, 0),
+        datetime(2026, 8, 30, 8, 0, 0),
+    ]
     mock_run.assert_called_once_with(
-        ["sudo", "pmset", "repeat", "wake", gla.PMSET_DAYS, "08:00:00"],
+        [
+            "sudo",
+            "pmset",
+            "schedule",
+            "wake",
+            "08/30/26 20:00:00",
+            "wake",
+            "08/30/26 08:00:00",
+        ],
         check=True,
     )
 
 
-def test_update_pmset_wake_schedule_rejects_empty() -> None:
+def test_schedule_wake_events_rejects_empty() -> None:
     with pytest.raises(ConfigError):
-        gla.update_pmset_wake_schedule([])
+        gla.schedule_wake_events([])
 
 
 def test_find_vocab_batch_executable_missing_raises() -> None:

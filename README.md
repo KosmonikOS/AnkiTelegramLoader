@@ -43,12 +43,34 @@ AnkiWeb/mobile, and goes back to sleep. No manual steps, no paid hosting.
 
    Everything else has a sensible default in `.env.example`.
 
-## One-time manual Anki setup
+## One-time manual setup
 
-In Anki.app, open **Preferences → Sync** and enable **"Automatically sync
-on profile open and close."** The sync-trigger step (below) relies entirely
-on this — without it, opening and quitting Anki.app does nothing to sync
-your new cards to AnkiWeb/mobile.
+**Anki:** open Anki.app → **Preferences → Sync** and enable **"Automatically
+sync on profile open and close."** The sync-trigger step (below) relies
+entirely on this — without it, opening and quitting Anki.app does nothing to
+sync your new cards to AnkiWeb/mobile.
+
+**Passwordless `pmset` for your user:** the scheduler (below) needs to run
+`sudo pmset schedule wake ...` unattended, on every `vocab-batch` run, to
+keep the Mac's wake schedule renewed — see [Scheduling](#scheduling) for
+why. `sudo` normally prompts for a password, which a scheduled background
+run can never answer, so grant your account passwordless access to `pmset`
+specifically (not full `sudo`):
+
+```bash
+sudo visudo -f /etc/sudoers.d/vocab-pipeline-pmset
+```
+
+Add this line (replace `<your-username>` with `whoami`'s output), then save:
+
+```
+<your-username> ALL=(root) NOPASSWD: /usr/bin/pmset
+```
+
+Without this, `vocab-setup-schedule` still works interactively (you'll be
+prompted once), but every unattended re-arm inside `vocab-batch` will fail —
+logged as a `rearm:` error in `logs/run_log.txt` — and the wake schedule will
+eventually stop advancing since it's never renewed.
 
 ## Running it manually
 
@@ -58,10 +80,10 @@ your new cards to AnkiWeb/mobile.
 - `vocab-process` — look up definitions for every pending word and write
   new notes into your Anki collection. Quits Anki.app first if it's
   running. Doesn't drain Telegram or trigger a sync.
-- `vocab-batch` — runs `vocab-drain` → `vocab-process` → a sync trigger, in
-  that order, and appends a summary line to `logs/run_log.txt`. This is
-  what the scheduler calls; run it manually to test the whole pipeline
-  end-to-end before scheduling anything.
+- `vocab-batch` — re-arms tomorrow's wake schedule, then runs `vocab-drain`
+  → `vocab-process` → a sync trigger, and appends a summary line to
+  `logs/run_log.txt`. This is what the scheduler calls; run it manually to
+  test the whole pipeline end-to-end before scheduling anything.
 
 Each phase is isolated from the others' failures — e.g. if Telegram is
 unreachable, `vocab-batch` still processes anything already queued and
@@ -73,16 +95,22 @@ still triggers a sync.
 vocab-setup-schedule
 ```
 
-This calls `sudo pmset`, so it will prompt for your account password.
+This calls `sudo pmset`, so it will prompt for your account password the
+first time (see the passwordless-`pmset` setup above to avoid that
+thereafter).
 
 Reads `WAKE_TIMES` from `.env` and, in one step:
 
-- Registers a `pmset repeat wake` entry for the **earliest** configured
-  time, so the Mac wakes from sleep (lid closed, no external display
-  needed) at that time. macOS only supports one recurring wake event (see
-  `man pmset`) — passing more than one `WAKE_TIMES` entry to `pmset` would
-  just have each call silently overwrite the last, so only the earliest is
-  registered there.
+- Arms a one-time `pmset schedule wake` event for the *next* occurrence of
+  **every** configured time, so the Mac reliably wakes from sleep (lid
+  closed, no external display needed) at each of them. macOS's `pmset
+  repeat` only supports a single recurring wake event (see `man pmset`), so
+  it can't express multiple daily wake times directly — `pmset schedule`
+  can hold several one-time events at once, but each is consumed the
+  moment it fires. To keep working day after day, `vocab-batch` re-arms
+  the next occurrence of every configured time as its first step, on every
+  run. As long as runs keep completing (see the passwordless-`pmset` note
+  above), the schedule renews itself indefinitely.
 - Writes a LaunchAgent plist to
   `~/Library/LaunchAgents/com.user.vocabpipeline.plist` with one
   `StartCalendarInterval` entry **per** configured wake time, pointing at
@@ -91,20 +119,16 @@ Reads `WAKE_TIMES` from `.env` and, in one step:
   reliably find `.env` (launchd otherwise gives the process no working
   directory to search from).
 
-Net effect: every `WAKE_TIMES` entry triggers a run if the Mac is already
-awake at that moment, but only the earliest one will actually **wake it
-from sleep**. For a machine that's sleeping most of the day, put your
-most important run time first, or accept that later times only catch runs
-opportunistically. `vocab-setup-schedule` prints which time was registered
-with `pmset` after it runs.
+Run `pmset -g sched` any time to see which wake events are currently
+pending — useful for confirming all of your `WAKE_TIMES` are actually
+armed, especially right after first running `vocab-setup-schedule`.
 
 A LaunchAgent (not a LaunchDaemon) is required because triggering Anki's
 sync needs a logged-in GUI session to launch Anki.app in. That means:
 staying logged in (the screen can lock, but the session must stay live),
 and never fully powering off the machine — sleep only. Telegram's own
 server-side retention is a hard 24-hour ceiling (see below), so schedule at
-least two wake times for margin, keeping in mind only the first reliably
-wakes the machine.
+least two wake times for margin.
 
 To change the schedule later, edit `WAKE_TIMES` in `.env` and re-run
 `vocab-setup-schedule` — never hand-edit the plist or `pmset` entries
@@ -113,6 +137,9 @@ directly.
 ## Architecture
 
 ```
+[0] rearm wake schedule
+        │  pmset schedule wake <next occurrence of each WAKE_TIMES entry>
+        ▼
 Telegram (server-side queue, 24h retention)
         │  getUpdates (long poll, one-shot)
         ▼
@@ -127,8 +154,9 @@ Telegram (server-side queue, 24h retention)
 [3] sync trigger
         │  open Anki.app (sync-on-open) → wait → quit again
         ▼
-vocab-batch chains [1]→[2]→[3] and logs a summary; a LaunchAgent + pmset
-wake schedule runs it unattended, a few times a day.
+vocab-batch chains [0]→[1]→[2]→[3] and logs a summary; a LaunchAgent, woken
+by the pmset schedule [0] itself keeps renewing, runs it unattended, a few
+times a day.
 ```
 
 See [`PLAN.md`](PLAN.md) for the full design rationale, including why each
@@ -145,6 +173,14 @@ piece was built this way.
 - `launchctl list | grep vocabpipeline` — confirms the LaunchAgent is
   loaded. An entry with a non-zero last exit code means the last run
   crashed before writing its log line.
+- `rearm=False` or a `rearm:` error in `run_log.txt` — the wake-schedule
+  renewal failed for that run, most often because passwordless `pmset`
+  isn't set up yet (see [One-time manual setup](#one-time-manual-setup)).
+  One failed rearm isn't fatal (today's still-pending wake events aren't
+  affected), but it needs fixing before the next occurrence of the time
+  that failed to renew.
+- `pmset -g sched` — lists currently pending wake events; compare against
+  your `WAKE_TIMES` to confirm the schedule is actually armed.
 - A `"failed"` entry in `state/pending_words.jsonl` means that word's
   lookup or Anki write raised an error — check its `error` field. To
   retry it, edit that line's `"status"` back to `"pending"` (and clear
@@ -159,11 +195,16 @@ piece was built this way.
   unrecoverable — this is Telegram's server-side limit, not a bug here.
   Scheduling multiple wake times a day gives margin but doesn't remove the
   ceiling.
-- **Only one wake time actually wakes the Mac from sleep.** `pmset repeat`
-  supports a single recurring wake event, so `vocab-setup-schedule`
-  registers only the earliest `WAKE_TIMES` entry with it. Other entries
-  still trigger `vocab-batch` via the LaunchAgent, but only when the Mac
-  happens to already be awake at that time.
+- **The wake schedule is self-renewing, not permanent.** Every configured
+  time wakes the Mac reliably, but only because `vocab-batch` re-arms the
+  next occurrence of each one on every run (`pmset schedule` only holds
+  one-time events, unlike `pmset repeat`, which can't express more than one
+  daily wake time at all — see Scheduling above). If a run's rearm step
+  keeps failing — most commonly because passwordless `pmset` isn't set up,
+  or the Mac is fully powered off across a gap and no run ever executes to
+  renew it — that time's schedule stops advancing until you fix the cause
+  and either wait for a run that succeeds or re-run
+  `vocab-setup-schedule` manually to re-arm it immediately.
 - **The `anki` pip package must be kept in sync with Anki.app.** Anki.app
   auto-updates; re-check the pin in `pyproject.toml` after any major
   update, or collection writes may fail (safer than silent corruption, but

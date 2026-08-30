@@ -1,4 +1,4 @@
-"""Master orchestrator: drain, process, and sync in one scheduled run.
+"""Master orchestrator: rearm, drain, process, and sync in one scheduled run.
 
 This is what the LaunchAgent (see :mod:`vocab_pipeline.generate_launchagent`)
 invokes on each wake. Each phase is attempted independently — a failure in
@@ -6,20 +6,27 @@ one (e.g. Telegram unreachable) never skips the others, since there may
 still be earlier-queued words worth processing, or a sync worth running,
 regardless. Every run appends one line to ``logs/run_log.txt`` summarizing
 what happened, so unattended runs stay inspectable after the fact.
+
+The wake-schedule rearm runs first and is tried independently of everything
+else: it's what keeps macOS actually waking the Mac for future runs (see
+:mod:`vocab_pipeline.generate_launchagent`), so it matters more than any
+single word getting processed, and running it first minimizes the chance an
+unrelated crash elsewhere in this run stops it from happening.
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from vocab_pipeline import config, drain, process, sync_trigger
+from vocab_pipeline import config, drain, generate_launchagent, process, sync_trigger
 
 
 @dataclass
 class BatchResult:
-    """Outcome of one full drain → process → sync run.
+    """Outcome of one full rearm → drain → process → sync run.
 
     Attributes:
         started_at: ISO 8601 UTC timestamp of when the run began.
+        rearmed: Whether the next wake events were successfully re-armed.
         drained: Number of new words pulled from Telegram.
         processed: Number of pending words attempted against Anki.
         succeeded: Number of those written successfully.
@@ -29,6 +36,7 @@ class BatchResult:
     """
 
     started_at: str
+    rearmed: bool
     drained: int
     processed: int
     succeeded: int
@@ -38,13 +46,20 @@ class BatchResult:
 
 
 def run_batch() -> BatchResult:
-    """Run drain, process, and sync-trigger once, in sequence.
+    """Run wake-rearm, drain, process, and sync-trigger once, in sequence.
 
     Returns:
         A summary of what each phase did, including any errors.
     """
     started_at = datetime.now(UTC).isoformat()
     errors: list[str] = []
+
+    rearmed = False
+    try:
+        generate_launchagent.schedule_wake_events(config.WAKE_TIMES)
+        rearmed = True
+    except Exception as exc:
+        errors.append(f"rearm: {exc}")
 
     drained_count = 0
     try:
@@ -68,6 +83,7 @@ def run_batch() -> BatchResult:
 
     return BatchResult(
         started_at=started_at,
+        rearmed=rearmed,
         drained=drained_count,
         processed=processed,
         succeeded=succeeded,
@@ -88,9 +104,9 @@ def _format_log_line(result: BatchResult) -> str:
     """
     status = "ok" if not result.errors else f"errors={'; '.join(result.errors)}"
     return (
-        f"{result.started_at} drained={result.drained} processed={result.processed} "
-        f"succeeded={result.succeeded} failed={result.failed} synced={result.synced} "
-        f"{status}\n"
+        f"{result.started_at} rearmed={result.rearmed} drained={result.drained} "
+        f"processed={result.processed} succeeded={result.succeeded} failed={result.failed} "
+        f"synced={result.synced} {status}\n"
     )
 
 
@@ -101,7 +117,7 @@ def main() -> None:
         f.write(_format_log_line(result))
 
     print(
-        f"Drained {result.drained}, processed {result.processed} "
+        f"Rearmed={result.rearmed}. Drained {result.drained}, processed {result.processed} "
         f"({result.succeeded} succeeded, {result.failed} failed), "
         f"synced={result.synced}."
     )
