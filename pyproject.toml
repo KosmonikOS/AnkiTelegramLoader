@@ -1,0 +1,55 @@
+[project]
+name = "vocab-pipeline"
+version = "0.1.0"
+description = "Telegram-to-Anki vocabulary pipeline with headless batch processing"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    # Pin this to match your installed Anki.app version exactly (Anki About
+    # dialog shows it). The collection schema/pylib API can change between
+    # releases, so a mismatched pin risks failed or incorrect writes. Default
+    # below is the latest release at the time this project was scaffolded.
+    "anki==26.8.1",
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.8", "ruff>=0.4", "pytest>=8.0", "types-requests>=2.31"]
+
+[project.scripts]
+vocab-drain = "vocab_pipeline.drain:main"
+vocab-process = "vocab_pipeline.process:main"
+vocab-batch = "vocab_pipeline.run_batch:main"
+vocab-setup-schedule = "vocab_pipeline.generate_launchagent:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["PLAN.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "D", "UP"]
+ignore = ["D203", "D213"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+disallow_untyped_defs = true
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = "anki.*"
+ignore_missing_imports = true
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
